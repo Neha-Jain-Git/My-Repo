@@ -1,0 +1,255 @@
+# -------------------------------------------------------------
+# Salesforce Validation to Production (Pre-Deploy Check)
+# -------------------------------------------------------------
+name: Validate to Production
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: write
+
+env:
+  environment: PROD
+  SF_PROD_AUTH_URL: ${{ secrets.SF_PROD_AUTH_URL }}
+  PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+  SNOW_INSTANCE: optum.service-now.com
+  SNOW_USER: ${{ vars.SNOW_USER_NAME }}
+  SNOW_PASSWORD: ${{ secrets.SNOW_PASSWORD }}
+  ASSIGNMENT_GROUP_NAME: 'e1593c734f65fe80648a8e1f0210c763'
+  VARIABLE_NAME: LAST_VALIDATION_ASYNC_ID
+
+jobs:
+  validate-to-prod:
+    runs-on: uhg-runner
+    if: contains('["njain95_uhg", "uchandr5_uhg", "btiwary1_uhg", "sgopal22_uhg", "sdevi15_uhg", "svarma3__uhg"]', github.actor)
+    environment: PROD
+    outputs:
+      Validate_status: ${{ steps.deploy.outputs.Validate_status }}
+    
+    steps:
+      # -----------------------------------------------------------
+      # Step 1: Validate Change Request in SNOW
+      # -----------------------------------------------------------
+      - name: Validate Change Request in SNOW
+        id: Validate-CR
+        run: |
+          echo "🔍 Checking for active or upcoming CRs within 24 hours..."
+
+          RESPONSE=$(curl -s -X GET "https://${SNOW_INSTANCE}/api/now/table/change_request?sysparm_query=assignment_group=${ASSIGNMENT_GROUP_NAME}^stateIN-1,2^end_date>javascript:gs.now()^NQ(start_dateBETWEENjavascript:gs.now()@javascript:gs.hoursAgoStart(24))&sysparm_fields=number,state,short_description,start_date,end_date" \
+            -u "$SNOW_USER:$SNOW_PASSWORD" -H "Accept: application/json")
+
+          echo "ServiceNow API Response:"
+          echo "$RESPONSE" | jq .
+
+          COUNT=$(echo "$RESPONSE" | jq -r '.result | length')
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "❌ No approved CR found for the next 24 hours."
+            exit 1
+          fi
+
+          CR_NUMBER=$(echo "$RESPONSE" | jq -r '.result[0].number')
+          CR_STATE=$(echo "$RESPONSE" | jq -r '.result[0].state')
+          CR_START=$(echo "$RESPONSE" | jq -r '.result[0].start_date')
+          CR_END=$(echo "$RESPONSE" | jq -r '.result[0].end_date')
+
+          echo "✅ CR validation passed for $CR_NUMBER ($CR_STATE)"
+          echo "Change Window: $CR_START → $CR_END"
+
+          echo "CR_NUMBER=$CR_NUMBER" >> $GITHUB_ENV
+          echo "CR_STATE=$CR_STATE" >> $GITHUB_ENV
+
+      # -----------------------------------------------------------
+      # Step 2: Install NodeJS and Salesforce CLI
+      # -----------------------------------------------------------
+      - name: Install NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Configure JFrog npm registry
+        run: echo "//centraluhg.jfrog.io/artifactory/api/npm/maltss-npm-vir/:_authToken=${JFROG_NPM_TOKEN}" > ~/.npmrc
+        env:
+          JFROG_NPM_TOKEN: ${{ secrets.JFROG_NPM_TOKEN }}
+          
+      - name: Set Salesforce CLI registry
+        run: echo "SF_NPM_REGISTRY=https://centraluhg.jfrog.io/artifactory/api/npm/maltss-npm-vir/" >> $GITHUB_ENV
+          
+      - name: Set npm registry and SF_NPM_REGISTRY environment variable  
+        run: |  
+          sudo npm config set registry https://repo1.uhc.com/artifactory/api/npm/npm-virtual/ --global  
+          echo "SF_NPM_REGISTRY=https://repo1.uhc.com/artifactory/api/npm/npm-virtual/" >> $GITHUB_ENV
+ 
+      - name: Install Salesforce CLI
+        run: | 
+          npm install -g @salesforce/cli --registry=https://centraluhg.jfrog.io/artifactory/api/npm/maltss-npm-vir/
+          sf --version
+          echo "-- Set Salesforce CLI environment variables --"
+          echo "SF_DISABLE_AUTOUPDATE=true" >> $GITHUB_ENV
+          echo "SF_DISABLE_SOURCE_MEMBER_POLLING=true" >> $GITHUB_ENV
+
+      # -----------------------------------------------------------
+      # Step 3: Authenticate to Salesforce org using sfdxAuthUrl
+      # -----------------------------------------------------------
+      - name: Populate auth file with SF_AUTH secret
+        run: |
+          echo "${{ secrets.SF_PROD_AUTH_URL }}" > ./AUTHURL.txt
+          if [ $(wc -c < "./AUTHURL.txt") -le 1 ]; then
+            echo "❌ Missing AUTHURL secret"
+            exit 1
+          fi
+          
+      - name: Authenticate to the Org
+        run: sf org login sfdx-url --sfdx-url-file ./AUTHURL.txt --set-default --alias thisOrg
+
+      # -----------------------------------------------------------
+      # Step 4: Install sfdx-git-delta Plugin
+      # -----------------------------------------------------------
+      - name: Install sfdx git delta
+        run: echo y | sfdx plugins:install sfdx-git-delta@6.19.0
+
+      # -----------------------------------------------------------
+      # Step 5: Create Delta Package
+      # -----------------------------------------------------------
+      - name: Create delta package
+        run: |
+          mkdir -p build/temp/changed-sources
+          echo "Comparing changes from ${ { vars.LAST_GOOD_SHA_PROD } } → origin/main"
+          sf sgd source delta --from "${{ vars.LAST_GOOD_SHA_PROD }}" --to "origin/main" \
+            --output-dir build/temp/changed-sources/ --generate-delta --source-dir force-app/ --ignore-file .gitignore
+
+          find build/temp/changed-sources/ -type d -empty -delete
+          if [ ! -d "build/temp/changed-sources/package" ]; then
+            echo "⚠️ No changed metadata found. Exiting."
+            exit 0
+          fi
+
+          zip -r build/temp/changed-sources.zip build/temp/changed-sources/
+
+      - name: Display package.xml
+        run: |
+          echo "Contents of package.xml:"
+          cat build/temp/changed-sources/package/package.xml
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: changed-sources
+          path: build/temp/changed-sources.zip
+
+      # -----------------------------------------------------------
+      # Step 6: Clean destructiveChanges.xml
+      # -----------------------------------------------------------
+      - name: Remove destructiveChanges.xml
+        run: |
+          cat build/temp/changed-sources/destructiveChanges/destructiveChanges.xml || true
+          rm -f build/temp/changed-sources/destructiveChanges/destructiveChanges.xml
+
+      # -----------------------------------------------------------
+      # Step 7: Run Validation Deployment 
+      # -----------------------------------------------------------
+      - name: Run Validation Deployment (checkOnly)
+        id: validate
+        run: |
+          echo "Starting Salesforce Validation..."
+          if ! sf project deploy start \
+          --source-dir build/temp/changed-sources/ \
+          --target-org thisOrg \
+          --dry-run \
+          --wait 500 \
+          --json \
+          --test-level RunLocalTests \
+          --verbose > deploy-result.json 2> deploy-error.log; then
+            if grep -q '"name": "NothingToDeploy"' deploy-result.json; then
+              echo "No changes to deploy. Skipping..."
+              exit 0
+            fi
+              echo "❌ Validation failed."
+              echo "Validate_status=Failed" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Deployment validation succeeded."
+            echo "Validate_status=Succeeded" >> $GITHUB_OUTPUT
+          fi
+
+          LAST_VALIDATION_ASYNC_ID=$(jq -r '.result.id' deploy-result.json)
+          echo "ASYNC_ID=$LAST_VALIDATION_ASYNC_ID" >> $GITHUB_ENV
+          
+          echo "---- Validation Logs ----"
+          cat deploy-error.log || true
+          
+      - name: Upload deployment result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-result
+          path: deploy-result.json
+
+      # -----------------------------------------------------------
+      # Step 8: Save AsyncResultId to GitHub Environment Variable
+      # -----------------------------------------------------------
+      - name: Save AsyncResultId to GitHub Environment Variable
+        if: success()
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          ENVIRONMENT: PROD
+          VARIABLE_NAME: LAST_VALIDATION_ASYNC_ID
+        run: |
+          echo "Updating variable in environment: $ENVIRONMENT"
+          echo "Async ID: $LAST_VALIDATION_ASYNC_ID"
+          
+          curl -s -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/$OWNER/$REPO/environments/$ENVIRONMENT/variables/$VARIABLE_NAME \
+            -d "{\"name\":\"$VARIABLE_NAME\",\"value\":\"$LAST_VALIDATION_ASYNC_ID\"}"
+
+      # -----------------------------------------------------------
+      # Step 9: Send Email (Success/Failure)
+      # -----------------------------------------------------------
+      - name: Send Success Email
+        if: success()
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Validation to Production Successful"
+          to: sahil_varma@optum.com, brajesh_tiwary@optum.com, chandrasekhar_uppalapati@optum.com, shikha_devi@optum.com, gopal_shakti@optum.com, neha_jain@optum.com
+          from: "donotreply@optum.com"
+          body: |
+            Hello Team,
+            We are pleased to inform you that the validation process has been successfully completed.
+
+                Change Request: ${{ env.CR_NUMBER }}
+                Status: ${{ env.CR_STATE }}
+                AsyncResultId: ${{ env.LAST_VALIDATION_ASYNC_ID }}
+
+            Regards,
+            MALTSS Team
+
+      - name: Send Failure Email
+        if: failure()
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Validation to Production Failed"
+          to: sahil_varma@optum.com, brajesh_tiwary@optum.com, chandrasekhar_uppalapati@optum.com, shikha_devi@optum.com, gopal_shakti@optum.com, neha_jain@optum.com
+          from: "donotreply@optum.com"
+          body: |
+            Hello Team,
+            We regret to inform you that the validation process has failed.
+
+                Change Request: ${{ env.CR_NUMBER || 'N/A' }}
+                Status: ${{ env.CR_STATE || 'N/A' }}
+
+            Please review the associated Change Request in ServiceNow or refer to the Salesforce validation logs for further details.
+            
+            Regards,
+            MALTSS Team
