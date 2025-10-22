@@ -1,0 +1,307 @@
+# -------------------------------------------------------------
+# Salesforce Quick Deploy to Production
+# -------------------------------------------------------------
+name: Deploy to PR
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - GHTEST
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: write
+
+env:
+  environment: PROD
+  SF_PROD_AUTH_URL: ${{ secrets.SF_PROD_AUTH_URL }}
+  PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+  SNOW_INSTANCE: optum.service-now.com
+  SNOW_USER: ${{ vars.SNOW_USER_NAME }}
+  SNOW_PASSWORD: ${{ secrets.SNOW_PASSWORD }}
+  ASSIGNMENT_GROUP_NAME: 'e1593c734f65fe80648a8e1f0210c763'
+  VARIABLE_NAME: LAST_VALIDATION_ASYNC_ID
+  LAST_VALIDATION_ASYNC_ID: ${{ vars.LAST_VALIDATION_ASYNC_ID }}
+
+jobs:
+  snow-check:
+    runs-on: uhg-runner
+    environment: PROD
+    if: contains('["njain95_uhg", "uchandr5_uhg", "btiwary1_uhg", "sgopal22_uhg", "sdevi15_uhg", "svarma3_uhg"]', github.actor)
+
+    outputs:
+      CR_Found: ${{ steps.snow_change.outputs.CR_Found }}
+
+    steps:
+      - name: Display current GitHub time
+        run: |
+          echo "GitHub Runner UTC Time:"
+          GITHUB_TIME=$(date -u +"%Y-%m-%d %H:%M:%S")
+          echo "GitHub UTC: $GITHUB_TIME"
+          echo "GITHUB_TIME=$GITHUB_TIME" >> $GITHUB_ENV
+
+      - name: Display current time from SNOW
+        id: snow_time
+        run: |
+          echo "Fetching current time from ServiceNow..."
+          SNOW_TIME=$(curl -s --user "${SNOW_USER}:${SNOW_PASSWORD}" \
+            "https://${SNOW_INSTANCE}/api/now/table/change_request?sysparm_query=ORDERBYDESCsys_updated_on&sysparm_limit=1&sysparm_fields=sys_updated_on" \
+            -H "Accept: application/json" | jq -r '.result[0].sys_updated_on')
+          echo "ServiceNow Instance Time: $SNOW_TIME"
+          echo "SNOW_TIME=$SNOW_TIME" >> $GITHUB_ENV
+
+      - name: Fetch change requests within 24 hours
+        id: snow_change
+        run: |
+          echo "Fetching change requests assigned to group: ${ASSIGNMENT_GROUP_NAME} in next 24 hours"
+
+          SNOW_NOW=$(date -u +"%Y-%m-%d %H:%M:%S")
+          SNOW_NEXT24=$(date -u -d "+24 hours" +"%Y-%m-%d %H:%M:%S")
+
+          QUERY="assignment_group=${ASSIGNMENT_GROUP_NAME}^stateIN-1,2^start_dateONORAFTERjavascript:gs.minutesAgo(-1440)^end_dateONORAFTERjavascript:gs.now()^ORDERBYstart_date"
+          echo "ServiceNow Query: $QUERY"
+
+          response=$(curl -s -u "${SNOW_USER}:${SNOW_PASSWORD}" \
+            "https://${SNOW_INSTANCE}/api/now/table/change_request?sysparm_query=${QUERY}&sysparm_limit=1&sysparm_fields=number,state,short_description,start_date,end_date" \
+            -H "Accept: application/json")
+
+          echo "Response from ServiceNow:"
+          echo "$response" | jq .
+
+          count=$(echo "$response" | jq '.result | length')
+
+          if [ "$count" -eq 0 ]; then
+            echo "No valid Change Requests found."
+            echo "CR_Found=False" >> $GITHUB_OUTPUT
+          else
+            echo "Found $count eligible Change Request(s)."
+            echo "CR_Found=True" >> $GITHUB_OUTPUT
+            echo "$response" | jq -r '.result[] | "\(.number) | \(.state) | \(.start_date) | \(.end_date) | \(.short_description)"'
+          fi
+
+  Send_Missing_Notification:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: snow-check
+    if: needs.snow-check.outputs.CR_Found == 'False'
+
+    steps:
+      - name: Send Email on Failure
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Validation Failure - No Change Request Found"
+          to: neha_jain@optum.com
+          cc: neha_jain@optum.com
+          from: "donotreply@optum.com"
+          html_body: |
+            <html>
+            <body>
+              <p>Hello Team,</p>
+              <p>No valid Change Requests were found for the next 24 hours.</p>
+              <p>Please review ServiceNow for scheduling before redeploying.</p>
+              <p>Regards,<br/>MALTSS Team</p>
+            </body>
+            </html>
+
+      - name: Mark job as failed
+        run: exit 1
+
+  Async-ID-Check:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: snow-check
+    if: needs.snow-check.outputs.CR_Found == 'True'
+
+    outputs:
+      Async_Found: ${{ steps.Async.outputs.Async_Found }}
+
+    steps:
+      - name: Verify Async ID Availability
+        id: Async
+        run: |
+          echo "Checking if Async ID is available..."
+          if [ -z "${LAST_VALIDATION_ASYNC_ID}" ] || [ "${LAST_VALIDATION_ASYNC_ID}" == "null" ]; then
+            echo "No Async ID found in environment. Please run 'Validate to Production' first."
+            echo "Async_Found=False" >> $GITHUB_OUTPUT
+          else
+            echo "Found Async ID: ${LAST_VALIDATION_ASYNC_ID}"
+            echo "Async_Found=True" >> $GITHUB_OUTPUT
+          fi
+
+  Send_Missing_Async_Notification:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: Async-ID-Check
+    if: needs.Async-ID-Check.outputs.Async_Found == 'False'
+
+    steps:
+      - name: Send Email on Missing Async ID
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Quick Deploy Failed - Missing Async ID"
+          to: neha_jain@optum.com
+          from: "donotreply@optum.com"
+          html_body: |
+            <html>
+            <body>
+              <p>Hello Team,</p>
+              <p>No Async ID found for Quick Deploy. Please run 'Validate to Production' before retrying.</p>
+              <p>Regards,<br/>MALTSS Team</p>
+            </body>
+            </html>
+
+  quick-deploy:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: Async-ID-Check
+    if: needs.Async-ID-Check.outputs.Async_Found == 'True'
+    outputs:
+      Deploy_status: ${{ steps.quickdeploy.outputs.Deploy_status }}
+
+    steps:
+      - name: Install NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure JFrog npm registry
+        run: echo "//centraluhg.jfrog.io/artifactory/api/npm/maltss-npm-vir/:_authToken=${JFROG_NPM_TOKEN}" > ~/.npmrc
+        env:
+          JFROG_NPM_TOKEN: ${{ secrets.JFROG_NPM_TOKEN }}
+
+      - name: Set npm registry
+        run: |
+          sudo npm config set registry https://repo1.uhc.com/artifactory/api/npm/npm-virtual/ --global
+          echo "SF_NPM_REGISTRY=https://repo1.uhc.com/artifactory/api/npm/npm-virtual/" >> $GITHUB_ENV
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli --registry=https://centraluhg.jfrog.io/artifactory/api/npm/maltss-npm-vir/
+          echo "SF_DISABLE_AUTOUPDATE=true" >> $GITHUB_ENV
+          echo "SF_DISABLE_SOURCE_MEMBER_POLLING=true" >> $GITHUB_ENV
+
+      - name: Populate auth file
+        run: echo "${{ secrets.SF_PROD_AUTH_URL }}" > ./AUTHURL.txt
+
+      - name: Authenticate to the Org
+        run: sf org login sfdx-url --sfdx-url-file ./AUTHURL.txt --set-default --alias thisOrg
+
+      - name: Install sfdx git delta
+        run: echo y | sfdx plugins:install sfdx-git-delta@6.19.0
+
+      - name: Run Quick Deploy
+        id: quickdeploy
+        run: |
+          echo "Starting Quick Deploy using Async ID: ${{ env.LAST_VALIDATION_ASYNC_ID }}"
+          sf deploy metadata quick \
+            --target-org thisOrg \
+            --job-id "${{ env.LAST_VALIDATION_ASYNC_ID }}" \
+            --wait 500 \
+            --json > quickdeploy-result.json 2> quickdeploy-error.log || true
+
+          STATUS=$(jq -r '.result.status' quickdeploy-result.json)
+          echo "Deployment Status: $STATUS"
+          echo "Deploy_status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Upload Deployment Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickdeploy-result
+          path: quickdeploy-result.json
+
+  save_last_good_sha:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: quick-deploy
+    if: needs.quick-deploy.outputs.Deploy_status == 'Succeeded'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Update SHA ID and Clear Async ID
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ENV_NAME: PROD
+          VARIABLE_NAME: LAST_GOOD_SHA_PROD
+          SHA: ${{ github.sha }}
+        run: |
+          echo "Updating $VARIABLE_NAME in environment $ENV_NAME with SHA=$SHA"
+          RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
+            -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/$OWNER/$REPO/environments/$ENV_NAME/variables/$VARIABLE_NAME \
+            -d "{\"name\":\"$VARIABLE_NAME\",\"value\":\"$SHA\"}")
+
+          if [ "$RESPONSE" -eq 404 ]; then
+            echo "Variable not found, creating instead..."
+            RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              https://api.github.com/repos/$OWNER/$REPO/environments/$ENV_NAME/variables \
+              -d "{\"name\":\"$VARIABLE_NAME\",\"value\":\"$SHA\"}")
+          fi
+
+          echo "Clearing Async ID..."
+          curl -s -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/$OWNER/$REPO/environments/$ENV_NAME/variables/LAST_VALIDATION_ASYNC_ID \
+            -d "{\"name\":\"LAST_VALIDATION_ASYNC_ID\",\"value\":\"\"}"
+
+  Send_Failure_Notification:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: quick-deploy
+    if: needs.quick-deploy.outputs.Deploy_status == 'Failed'
+
+    steps:
+      - name: Send Email on Failure
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Deployment Failure - Quick Deploy"
+          to: neha_jain@optum.com
+          from: "donotreply@optum.com"
+          html_body: |
+            <html>
+            <body>
+              <p>Hello Team,</p>
+              <p>Quick Deploy has failed. Please review the deployment logs for more information.</p>
+              <p>Regards,<br/>MALTSS Team</p>
+            </body>
+            </html>
+
+  Send_Success_Notification:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: quick-deploy
+    if: needs.quick-deploy.outputs.Deploy_status == 'Succeeded'
+
+    steps:
+      - name: Send Email on Success
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Deployment Successful - Quick Deploy"
+          to: neha_jain@optum.com
+          from: "donotreply@optum.com"
+          html_body: |
+            <html>
+            <body>
+              <p>Hello Team,</p>
+              <p>Quick Deploy has completed successfully! Post-deployment verification can begin.</p>
+              <p>Regards,<br/>MALTSS Team</p>
+            </body>
+            </html>

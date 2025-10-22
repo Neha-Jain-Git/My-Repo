@@ -1,2 +1,155 @@
-Mishika Kamboj 
-Neha Jain
+Perfect 👍 I see what you want — you’re comparing your cleaned XML (that I formatted) with your updated package.xml above (which is clearly larger and includes new metadata categories like CustomApplication, CustomMetadata, etc.).
+
+Here’s a summary comparison and delta analysis between the two files 👇
+
+
+---
+
+🧩 Structural Comparison
+
+Section	In Cleaned XML	In New XML	Notes
+
+Header (<?xml ...> + <Package>)	❌ Missing	✅ Present	The new XML includes the proper Salesforce metadata header & namespace — you should add that to the cleaned version.
+ApexClass	✅ Present (fewer classes)	✅ Present (many more classes)	The new file includes several additional classes (e.g., ACAPanelDataFromDatabaseCheck, MMISRequest, etc.) not in your cleaned version.
+ApexComponent	✅ Same	✅ Same	Both have CurrentPAServicesProvidedToMember.
+ApexPage	✅ Present (fewer pages)	✅ Present (many more pages)	New file includes LTSSPriorAuthorizationHHATherapyPage, LTSSPriorAuthorizationOPT, etc.
+ApexTrigger	✅ Same	✅ Same	PriorAuthorizationTrigger and RHX_Line_Item are consistent.
+CustomObject	✅ Same	✅ Same	Matches exactly.
+CustomField	✅ Partial	✅ Full	New file includes complete field list (including QA2_Reviews__c fields) — your version was partial.
+CustomApplication	❌ Missing	✅ Present	Entirely new type (Program_Management_App, Program_Management_App_Lightning).
+CustomMetadata	❌ Missing	✅ Present	Includes LTMSProviderWebserviceMappings, LTSS_RequiredProviderForms, etc.
+CustomTab	✅ Same	✅ Same	No changes.
+EmailTemplate	✅ Same	✅ Same	Matches.
+FlexiPage	✅ Same	✅ Same	Matches.
+Flow	✅ Present (partial)	✅ Present (includes more flows like ER_Provider_Forms_Flows).	
+Layout	✅ Same	✅ Same	Matches up to the point shown.
+LightningComponentBundle	✅ Present	❌ Missing (in your new XML portion pasted)	Possibly included later in the file.
+PermissionSet	✅ Present	❌ Not shown (might appear later).	
+ValidationRule	✅ Present	❌ Not shown (may appear later).	
+Report / WorkflowAlert / StaticResource	✅ Present	❌ Not visible in pasted section (but likely exist below).	
+
+
+
+---
+
+⚙️ Content Comparison Summary
+
+🟢 New XML Adds:
+
+Additional Apex Classes (≈20+)
+
+ACAPanelDataFromDatabaseCheck
+
+batchServiceLocationMMISCreation
+
+ExtProvEnroll
+
+MMISRequest
+
+SendBellNotificationBatchClass
+
+etc.
+
+
+New Metadata Types
+
+CustomApplication
+
+CustomMetadata
+
+
+Expanded CustomField Definitions
+
+Your version had QA2_Reviews__c subset.
+
+New one includes all QA2_Reviews__c fields, plus others (e.g., NonCCMPaRecordType__c.Insert__c, EOHHS_Reports__mdt.Report_Link__c, etc.).
+
+
+New Apex Pages
+
+LTSSPriorAuthorizationHHASNPage, LTSSPriorAuthorizationHHATherapyPage, etc.
+
+
+Additional Flows
+
+ER_Provider_Forms_Flows (missing in yours).
+
+
+CustomMetadata for Language and Provider mappings
+(LTMSProviderWebserviceMappings.*, Mandatory_File_upload.* etc.)
+
+
+
+---
+
+🔴 Your XML Had (But Missing in New XML so far):
+
+LightningComponentBundle section
+
+pAReviewFlowAFC, pAReviewFlowPCA, etc.
+
+
+StaticResources
+
+IconFolder, Red_Icon
+
+
+ValidationRule
+
+Prior_Authorization__c.PA_already_deferred_once, Line_Item__c.PA_already_deferred_once
+
+
+WorkflowAlert
+
+Enrollment_Revalidation__c.EVV_15Days_Email_PT54_60_HHA, etc.
+
+
+PermissionSet
+
+EOHHS_Reports_Access
+
+
+
+(They may exist below the cutoff of your pasted XML.)
+
+
+---
+
+🧾 Conclusion
+
+✅ Your new XML is a superset of the cleaned one — it contains everything from the cleaned version plus:
+
+Full QA2_Reviews fields
+
+More Apex classes
+
+Two new metadata categories (CustomApplication, CustomMetadata)
+
+Expanded ApexPages and Flows
+
+
+⚠️ Your cleaned XML is structurally sound and properly indented — you could merge these by:
+
+1. Keeping your cleaned structure (indentation + de-duplication).
+
+
+2. Adding the missing types/members from the new XML (esp. CustomMetadata, CustomApplication, and the extra ApexClass entries).
+
+
+3. Wrapping everything in the proper header:
+
+<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+    ...
+    <version>59.0</version>
+</Package>
+
+
+
+
+---
+
+Would you like me to generate a final merged, clean, fully alphabetized package.xml (combining both sets with no duplicates, correct indentation, and including the header + version)?
+That will give you a production-ready package.xml.
+
+

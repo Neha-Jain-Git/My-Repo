@@ -1,0 +1,148 @@
+name: Generate Audit Report
+
+on:
+  schedule:
+    - cron: '30 9 * * *' # Runs daily at 4:30 AM EST 
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+
+jobs:
+  generate-and-save-audit-report:
+    runs-on: uhg-runner
+    environment: audit     # 👈 Replace with your actual environment name if different
+    env:
+      REPORT_FILE: AuditReport_${{ github.run_id }}.csv
+
+    steps:
+      # ✅ Authenticated checkout for self-hosted runner
+      - name: Checkout code (main)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Configure Git author
+        run: |
+          git config user.email "maltss_tech@optum.com"
+          git config user.name "maltssdeploy"
+
+      - name: Set Report Date
+        run: |
+          echo "REPORT_DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Determine last processed commit
+        run: |
+          if [ -z "${{ vars.LAST_PROCESSED_COMMIT }}" ]; then
+            echo "No LAST_PROCESSED_COMMIT variable found. Using repository root commit."
+            value=$(git rev-list --max-parents=0 HEAD)
+          else
+            value=${{ vars.LAST_PROCESSED_COMMIT }}
+          fi
+          echo "LAST_PROCESSED_COMMIT=$value" >> $GITHUB_ENV
+
+      - name: Check for changes in force-app/main/default
+        run: |
+          changed_files=$(git diff --name-only "$LAST_PROCESSED_COMMIT"..HEAD -- force-app/main/default/ || true)
+          if [ -z "$changed_files" ]; then
+            echo "No changes in force-app/main/default since last run."
+            echo "HAS_CHANGES=false" >> $GITHUB_ENV
+          else
+            echo "Found changes in force-app/main/default:"
+            echo "$changed_files"
+            echo "HAS_CHANGES=true" >> $GITHUB_ENV
+          fi
+
+      - name: Stop job if no changes
+        if: env.HAS_CHANGES == 'false'
+        run: |
+          echo "No relevant changes detected in force-app/main/default. Skipping report generation."
+          exit 0
+
+      - name: Generate commit audit report
+        if: env.HAS_CHANGES == 'true'
+        run: |
+          echo "Generating commit audit report..."
+          mkdir -p temp
+          echo "COMMIT ID,MEMBER EMAIL,DATETIME (IST),COMMENTS,NUMBER OF FILES,NUMBER OF ADDITIONS,NUMBER OF DELETIONS" > temp/AuditReport1.csv
+          git log "$LAST_PROCESSED_COMMIT"..HEAD -- force-app/main/default/ \
+            --pretty=format:'"%H","%ae","%aD","%s",' --shortstat --no-merges | paste - - - >> temp/AuditReport1.csv
+          echo "FILES" > temp/AuditReport2.csv
+          git log "$LAST_PROCESSED_COMMIT"..HEAD --name-only --pretty=format:"" -- force-app/main/default/ > temp/AuditReport3.csv
+          awk 'NF {TMP=TMP $0; next} {print TMP " "; TMP=" "} END {print TMP " "}' temp/AuditReport3.csv > temp/AuditReport4.csv
+          sed -r '/^\s*$/d' temp/AuditReport4.csv > temp/AuditReport5.csv
+          paste temp/AuditReport5.csv >> temp/AuditReport2.csv
+          paste -d , temp/AuditReport1.csv temp/AuditReport2.csv > temp/AuditReport.csv
+          cp temp/AuditReport.csv "$REPORT_FILE"
+
+      # ✅ Correct environment variable update (working pattern)
+      - name: Update LAST_PROCESSED_COMMIT environment variable
+        if: env.HAS_CHANGES == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ENV_NAME: audit           # 👈 Replace if your environment name differs
+          VARIABLE_NAME: LAST_PROCESSED_COMMIT
+        run: |
+          echo "Updating $VARIABLE_NAME in environment $ENV_NAME..."
+          SHA=$(git log -1 --pretty=format:"%H" -- force-app/main/default/)
+          echo "New SHA: $SHA"
+
+          RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
+            -X PATCH \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"value\":\"$SHA\"}" \
+            "https://api.github.com/repos/$OWNER/$REPO/environments/$ENV_NAME/variables/$VARIABLE_NAME")
+
+          if [ "$RESPONSE" -eq 404 ]; then
+            echo "Variable not found, creating..."
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\":\"$VARIABLE_NAME\",\"value\":\"$SHA\"}" \
+              "https://api.github.com/repos/$OWNER/$REPO/environments/$ENV_NAME/variables"
+          elif [ "$RESPONSE" -eq 200 ]; then
+            echo "✅ Successfully updated $VARIABLE_NAME to $SHA"
+          else
+            echo "⚠️ Unexpected response: $RESPONSE"
+            cat response.json
+            exit 1
+          fi
+
+      - name: Upload Audit Report as artifact
+        if: env.HAS_CHANGES == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report-${{ env.REPORT_DATE }}
+          path: ${{ env.REPORT_FILE }}
+          retention-days: 90
+
+      - name: Send Email with Attachment
+        if: env.HAS_CHANGES == 'true'
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Daily Commit Audit Report - ${{ env.REPORT_DATE }} :: ${{ github.workflow }}"
+          to: neha_jain@optum.com, chandrasekhar_uppalapati@optum.com
+          from: notifications@github.com
+          attachments: ${{ env.REPORT_FILE }}
+          body: |
+            Dear Team,
+
+            Please find attached the **Daily Commit Audit Report** generated automatically by GitHub Actions on ${{ env.REPORT_DATE }}.
+
+            This report provides a consolidated record of repository activities within the last 24 hours. It captures commit identifiers, contributor details, commit messages, timestamps, and file-level modifications. The purpose of sharing this report is to ensure transparency, compliance, and effective monitoring of changes made to the codebase.
+
+            Thank you for your continued support in strengthening our compliance and operational excellence.
+
+            Regards,  
+            MALTSS Team 
+
+            ---
+            *This is an automated email. Please do not reply directly.*
