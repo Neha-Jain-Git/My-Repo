@@ -1,0 +1,67 @@
+name: SNOW Change Status Check
+
+on:
+  push:
+    branches:
+      - GHTEST
+
+permissions:
+  contents: read
+env:
+      environment: PROD
+      SF_PROD_AUTH_URL: ${{ secrets.SF_PROD_AUTH_URL }}
+      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+      SNOW_INSTANCE: optum.service-now.com
+      SNOW_USER: ${{ vars.SNOW_USER_NAME }}
+      SNOW_PASSWORD: ${{ secrets.SNOW_PASSWORD }}
+      SNOW_GROUP: 'e1593c734f65fe80648a8e1f0210c763'
+      VARIABLE_NAME: LAST_VALIDATION_ASYNC_ID
+
+
+jobs:
+  snow-check:
+    runs-on: uhg-runner
+    environment: PROD
+    steps:
+          
+      - name: Step 1 - Display current GitHub time
+        run: |
+          echo "GitHub Runner UTC Time:"
+          date -u
+          echo "Local Time:"
+          date
+
+      - name: Step 2 - Display current time from SNOW
+        run: |
+          echo "Fetching current time from ServiceNow..."
+          curl -s -X GET "https://${SNOW_INSTANCE}/api/now/table/sys_time_zone" \
+            -u "$SNOW_USER:$SNOW_PASSWORD" -H "Accept: application/json"
+
+      - name: Step 3 - Fetch latest Change Request assigned to $SNOW_GROUP
+        id: snow_change
+        run: |
+          echo "Fetching latest change request for group: ${SNOW_GROUP}"
+          response=$(curl -s -u "${SNOW_USER}:${SNOW_PASSWORD}" \
+            "https://${SNOW_INSTANCE}/api/now/table/change_request?sysparm_query=assignment_group.name=${SNOW_GROUP}^ORDERBYDESCsys_updated_on&sysparm_limit=1")
+          
+          echo "$response" | jq .
+          number=$(echo "$response" | jq -r '.result[0].number')
+          sys_id=$(echo "$response" | jq -r '.result[0].sys_id')
+
+          echo "Latest Change Number: $number"
+          echo "sys_id: $sys_id"
+
+          echo "number=$number" >> $GITHUB_ENV
+          echo "sys_id=$sys_id" >> $GITHUB_ENV
+
+      - name: Step 4 - Display the status of the change number
+        run: |
+          if [ -z "$number" ]; then
+            echo "No change found for group ${SNOW_GROUP}"
+            exit 1
+          fi
+
+          echo "Fetching status for change number: ${number}"
+          curl -s -u "${SNOW_USER}:${SNOW_PASSWORD}" \
+            "https://${SNOW_INSTANCE}/api/now/table/change_request?sysparm_query=number=${number}&sysparm_fields=number,state,short_description" \
+            | jq .

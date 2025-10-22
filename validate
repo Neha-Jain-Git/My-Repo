@@ -1,0 +1,313 @@
+# -------------------------------------------------------------
+# Salesforce Validation to Production (Pre-Deploy Check)
+# -------------------------------------------------------------
+name: Validate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - GHTEST
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: write
+
+env:
+  environment: PROD
+  SF_PROD_AUTH_URL: ${{ secrets.SF_PROD_AUTH_URL }}
+  PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+  SNOW_INSTANCE: optumstage.service-now.com
+  SNOW_USER: ${{ vars.SNOW_USER_NAME }}
+  SNOW_PASSWORD: ${{ secrets.SNOW_PASSWORD }}
+  SNOW_GROUP: 'e1593c734f65fe80648a8e1f0210c763'
+  VARIABLE_NAME: LAST_VALIDATION_ASYNC_ID
+
+jobs:
+  # -----------------------------------------------------------
+  # Job: Verify ServiceNow CR
+  # -----------------------------------------------------------
+  Verify_CR:
+    runs-on: uhg-runner
+    environment: PROD
+    if: contains('["njain95_uhg", "uchandr5_uhg", "btiwary1_uhg", "sgopal22_uhg", "sdevi15_uhg", "svarma3_uhg"]', github.actor)
+
+    outputs:
+      CR_Found: ${{ steps.snow_change.outputs.CR_Found }}
+      CR_NUMBER: ${{ steps.snow_change.outputs.CR_NUMBER }}
+      CR_STATE: ${{ steps.snow_change.outputs.CR_STATE }}
+      CR_DESC: ${{ steps.snow_change.outputs.CR_DESC }}
+
+    steps:
+      - name: Fetch change requests within 24 hours
+        id: snow_change
+        run: |
+          echo "GitHub Runner UTC Time: $(date -u +"%Y-%m-%d %H:%M:%S")"
+          QUERY="assignment_group=${SNOW_GROUP}^stateIN-1^((start_dateISNOTEMPTY^end_dateISNOTEMPTY^start_dateGTjavascript:gs.hoursAgo(-24))OR(start_dateISNOTEMPTY^end_dateISNOTEMPTY^start_dateONORBEFOREjavascript:gs.now()^end_dateONORAFTERjavascript:gs.now()))^ORDERBYstart_date"
+
+          response=$(curl -s -u "${SNOW_USER}:${SNOW_PASSWORD}" \
+            "https://${SNOW_INSTANCE}/api/now/table/change_request?sysparm_query=${QUERY}&sysparm_limit=1&sysparm_fields=number,state,short_description,start_date,end_date" \
+            -H "Accept: application/json")
+
+          count=$(echo "$response" | jq '.result | length')
+
+          if [ "$count" -eq 0 ]; then
+            echo "CR_Found=False" >> $GITHUB_OUTPUT
+          else
+            CR_NUMBER=$(echo "$response" | jq -r '.result[0].number')
+            CR_STATE=$(echo "$response" | jq -r '.result[0].state')
+            CR_DESC=$(echo "$response" | jq -r '.result[0].short_description')
+            echo "CR_Found=True" >> $GITHUB_OUTPUT
+            echo "CR_NUMBER=$CR_NUMBER" >> $GITHUB_OUTPUT
+            echo "CR_STATE=$CR_STATE" >> $GITHUB_OUTPUT
+            echo "CR_DESC=$CR_DESC" >> $GITHUB_OUTPUT
+          fi
+
+  # -----------------------------------------------------------
+  # Job: Notify Missing CR
+  # -----------------------------------------------------------
+  Send_Missing_Notification:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: Verify_CR
+    if: needs.Verify_CR.outputs.CR_Found == 'False'
+
+    steps:
+      - name: Send Email on Missing CR
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Validation Aborted — No Active Change Request Found"
+          to: neha_jain@optum.com
+          cc: neha_jain@optum.com
+          from: "donotreply@optum.com"
+          html_body: |
+            <html>
+            <body>
+              <p>Hello Team,</p>
+              <p>The validation process could not proceed because <b>no approved Change Request</b> was found in ServiceNow within the next 24 hours.</p>
+              <p>Please review the assignment group (<b>${{ env.SNOW_GROUP }}</b>) and ensure a valid CR is scheduled.</p>
+              <p>Regards,<br>MALTSS Team</p>
+            </body>
+            </html>
+
+      - name: Mark job as failed
+        run: exit 1
+
+  # -----------------------------------------------------------
+  # Job: Validation
+  # -----------------------------------------------------------
+  Validation:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: Verify_CR
+    if: needs.Verify_CR.outputs.CR_Found == 'True'
+
+    outputs:
+      Validate_status: ${{ steps.validate.outputs.Validate_status }}
+      LAST_VALIDATION_ASYNC_ID: ${{ steps.validate.outputs.LAST_VALIDATION_ASYNC_ID }}
+
+    steps:
+      - name: Install NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure JFrog npm registry
+        run: echo "//centraluhg.jfrog.io/artifactory/api/npm/maltss-npm-vir/:_authToken=${JFROG_NPM_TOKEN}" > ~/.npmrc
+        env:
+          JFROG_NPM_TOKEN: ${{ secrets.JFROG_NPM_TOKEN }}
+
+      - name: Set npm registry
+        run: |
+          sudo npm config set registry https://repo1.uhc.com/artifactory/api/npm/npm-virtual/ --global
+          echo "SF_NPM_REGISTRY=https://repo1.uhc.com/artifactory/api/npm/npm-virtual/" >> $GITHUB_ENV
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli --registry=https://centraluhg.jfrog.io/artifactory/api/npm/maltss-npm-vir/
+          sf --version
+          echo "SF_DISABLE_AUTOUPDATE=true" >> $GITHUB_ENV
+          echo "SF_DISABLE_SOURCE_MEMBER_POLLING=true" >> $GITHUB_ENV
+
+      - name: Populate auth file
+        run: |
+          echo "${{ secrets.SF_PROD_AUTH_URL }}" > ./AUTHURL.txt
+          if [ $(wc -c < "./AUTHURL.txt") -le 1 ]; then
+            echo "Missing AUTHURL secret"
+            exit 1
+          fi
+
+      - name: Authenticate Org
+        run: sf org login sfdx-url --sfdx-url-file ./AUTHURL.txt --set-default --alias thisOrg
+
+      - name: Install sfdx-git-delta
+        run: echo y | sfdx plugins:install sfdx-git-delta@6.19.0
+
+      - name: Create delta package
+        run: |
+          mkdir -p build/temp/changed-sources
+          echo "GOOD_SHA: ${{ vars.LAST_GOOD_SHA_PROD }}"
+          sf sgd source delta --from "${{ vars.LAST_GOOD_SHA_PROD }}" --to "origin/GHTEST" \
+            --output-dir build/temp/changed-sources/ --generate-delta --source-dir force-app/ --ignore-file .gitignore
+
+          find build/temp/changed-sources/ -type d -empty -delete
+          if [ ! -d "build/temp/changed-sources/package" ]; then
+            echo "No changed metadata found. Exiting."
+            echo "Validate_status=Succeeded" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          zip -r build/temp/changed-sources.zip build/temp/changed-sources/
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: changed-sources
+          path: build/temp/changed-sources.zip
+          retention-days: 90
+
+      - name: Remove destructiveChanges.xml
+        run: rm -f build/temp/changed-sources/destructiveChanges/destructiveChanges.xml || true
+
+      - name: Run Validation Deployment
+        id: validate
+        run: |
+          echo "Starting Salesforce Validation..."
+          if ! sf project deploy start \
+            --source-dir build/temp/changed-sources/ \
+            --target-org thisOrg \
+            --dry-run \
+            --wait 500 \
+            --json \
+            --test-level RunSpecifiedTests --tests "LTSSPriorAuthPCAOneCarePDFCtrlTest" \
+            --verbose > validate-result.json 2> validate-error.log; then
+              echo "Validation failed."
+              echo "Validate_status=Failed" >> $GITHUB_OUTPUT
+          else
+              echo "Validation succeeded."
+              echo "Validate_status=Succeeded" >> $GITHUB_OUTPUT
+          fi
+
+          LAST_VALIDATION_ASYNC_ID=$(jq -r '.result.id // empty' validate-result.json)
+          echo "LAST_VALIDATION_ASYNC_ID=$LAST_VALIDATION_ASYNC_ID" >> $GITHUB_OUTPUT
+
+      - name: Upload validation result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validate-result
+          path: validate-result.json
+          retention-days: 90
+
+  # -----------------------------------------------------------
+  # Job: Save Async ID
+  # -----------------------------------------------------------
+  Save_AsyncID:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: Validation
+    if: needs.Validation.outputs.Validate_status == 'Succeeded'
+
+    steps:
+      - name: Save AsyncResultId
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          ENV_NAME: PROD
+          VARIABLE_NAME: LAST_VALIDATION_ASYNC_ID
+        run: |
+          echo "Updating environment variable..."
+          RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
+            -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/$OWNER/$REPO/environments/$ENV_NAME/variables/$VARIABLE_NAME \
+            -d "{\"name\":\"$VARIABLE_NAME\",\"value\":\"${{ needs.Validation.outputs.LAST_VALIDATION_ASYNC_ID }}\"}")
+
+          if [ "$RESPONSE" -eq 404 ]; then
+            echo "Variable not found. Creating new."
+            curl -s \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              https://api.github.com/repos/$OWNER/$REPO/environments/$ENV_NAME/variables \
+              -d "{\"name\":\"$VARIABLE_NAME\",\"value\":\"${{ needs.Validation.outputs.LAST_VALIDATION_ASYNC_ID }}\"}"
+          fi
+
+  # -----------------------------------------------------------
+  # Job: Email Notifications
+  # -----------------------------------------------------------
+  Send_Failure_Notification:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: [Verify_CR, Validation]
+    if: needs.Validation.outputs.Validate_status == 'Failed'
+
+    steps:
+      - name: Download validation result
+        uses: actions/download-artifact@v4
+        with:
+          name: validate-result
+          retention-days: 90
+
+      - name: Send Failure Email
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Validation Failed — ${{ needs.Verify_CR.outputs.CR_NUMBER }}"
+          to: neha_jain@optum.com
+          cc: neha_jain@optum.com
+          from: "donotreply@optum.com"
+          html_body: |
+            <html>
+            <body>
+              <p>Hello Team,</p>
+              <p>The Salesforce validation has <b>failed</b>.</p>
+              <p>Change Request: <b>${{ needs.Verify_CR.outputs.CR_NUMBER }}</b><br>
+              Status: <b>${{ needs.Verify_CR.outputs.CR_STATE }}</b></p>
+              <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Validation Logs</a></p>
+              <p>Regards,<br>MALTSS Team</p>
+            </body>
+            </html>
+
+  Send_Success_Notification:
+    runs-on: uhg-runner
+    environment: PROD
+    needs: [Verify_CR, Validation]
+    if: needs.Validation.outputs.Validate_status == 'Succeeded'
+
+    steps:
+      - name: Download validation result
+        uses: actions/download-artifact@v4
+        with:
+          name: validate-result
+          retention-days: 90
+
+      - name: Send Success Email
+        uses: uhg-pipelines/epl-send-mail@v1
+        with:
+          subject: "Validation Succeeded — ${{ needs.Verify_CR.outputs.CR_NUMBER }}"
+          to: neha_jain@optum.com
+          cc: neha_jain@optum.com
+          from: "donotreply@optum.com"
+          html_body: |
+            <html>
+            <body>
+              <p>Hello Team,</p>
+              <p>Validation completed successfully.</p>
+              <p>
+                Change Request: <b>${{ needs.Verify_CR.outputs.CR_NUMBER }}</b><br>
+                Status: <b>${{ needs.Verify_CR.outputs.CR_STATE }}</b><br>
+                AsyncResultId: <b>${{ needs.Validation.outputs.LAST_VALIDATION_ASYNC_ID }}</b>
+              </p>
+              <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Validation Logs</a></p>
+              <p>Regards,<br>MALTSS Team</p>
+            </body>
+            </html>
