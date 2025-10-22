@@ -1,236 +1,97 @@
-# ======================================================================
-# Salesforce Deployment Workflow (DDIQA Sandbox)
-# ======================================================================
-
-name: Deploy to DDIQA
+name: SNOW Change Status Check
 
 on:
-  pull_request:
-    types: [closed]
-    branches:
-      - DDIQAGH
-    paths:
-      - 'force-app/main/default/**'
   push:
     branches:
-      - DDIQAGH
-    paths:
-      - 'force-app/main/default/**'
-  workflow_dispatch:
+      - GHTEST
 
 permissions:
-  contents: write
-  pull-requests: write
-  checks: read
-  actions: write
+  contents: read
 
 env:
-  environment: DDIQA
-  SF_DDIQA_AUTH_URL: ${{ secrets.SF_DDIQA_AUTH_URL }}
+  environment: PROD
+  SF_PROD_AUTH_URL: ${{ secrets.SF_PROD_AUTH_URL }}
   PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+  SNOW_INSTANCE: optum.service-now.com
+  SNOW_USER: ${{ vars.SNOW_USER_NAME }}
+  SNOW_PASSWORD: ${{ secrets.SNOW_PASSWORD }}
+  SNOW_GROUP: 'e1593c734f65fe80648a8e1f0210c763'
+  VARIABLE_NAME: LAST_VALIDATION_ASYNC_ID
 
 jobs:
-  deploy-on-merge:
-    runs-on: uhg-runner-m
-    environment: DDIQA
-
-    outputs:
-      deploy_status: ${{ steps.deploy.outputs.deploy_status }}
+  snow-check:
+    runs-on: uhg-runner
+    environment: PROD
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install Salesforce CLI
+      - name: Step 1 - Display current GitHub time
         run: |
-          wget https://developer.salesforce.com/media/salesforce-cli/sf/channels/stable/sf-linux-x64.tar.xz
-          mkdir ~/sfdx
-          tar xJf sf-linux-x64.tar.xz -C ~/sfdx --strip-components 1
-          echo "$HOME/sfdx/bin" >> $GITHUB_PATH
-          export PATH=$HOME/sfdx/bin:$PATH
-          sf version
+          echo "GitHub Runner UTC Time:"
+          GITHUB_TIME=$(date -u +"%Y-%m-%d %H:%M:%S")
+          echo "GitHub UTC: $GITHUB_TIME"
+          echo "GITHUB_TIME=$GITHUB_TIME" >> $GITHUB_ENV
 
-      - name: Populate auth file with SF_AUTH secret
+      - name: Step 2 - Display current time from SNOW
+        id: snow_time
         run: |
-          echo "${{ secrets.SF_DDIQA_AUTH_URL }}" > ./AUTHURL.txt
-          if [ $(wc -c < "./AUTHURL.txt") -le 1 ]; then
-            echo "Missing AUTHURL secret"
+          echo "Fetching current time from ServiceNow (via change_request)..."
+          SNOW_TIME=$(curl -s --user "${SNOW_USER}:${SNOW_PASSWORD}" \
+            "https://${SNOW_INSTANCE}/api/now/table/change_request?sysparm_query=ORDERBYDESCsys_updated_on&sysparm_limit=1&sysparm_fields=sys_updated_on" \
+            -H "Accept: application/json" | jq -r '.result[0].sys_updated_on')
+          
+          echo "ServiceNow Instance Time: $SNOW_TIME"
+          echo "SNOW_TIME=$SNOW_TIME" >> $GITHUB_ENV
+
+      - name: Step 3 - Compare GitHub and SNOW time
+        run: |
+          echo "Comparing GitHub and ServiceNow time..."
+          echo "GitHub Time (UTC): $GITHUB_TIME"
+          echo "ServiceNow Time: $SNOW_TIME"
+
+          GH_TS=$(date -u -d "$GITHUB_TIME" +%s)
+          SN_TS=$(date -u -d "$SNOW_TIME" +%s)
+          DIFF_MIN=$(( (GH_TS - SN_TS) / 60 ))
+
+          echo "Time Difference (GitHub - SNOW): ${DIFF_MIN} minutes"
+          echo "DIFF_MIN=$DIFF_MIN" >> $GITHUB_ENV
+
+      - name: Step 4 - Fetch change requests within 24 hours
+        id: snow_change
+        run: |
+          echo "Fetching change requests assigned to group: ${SNOW_GROUP} in next 24 hours"
+
+          # Compute ServiceNow current time and 24 hours from now in UTC format
+          SNOW_NOW=$(date -u +"%Y-%m-%d %H:%M:%S")
+          SNOW_NEXT24=$(date -u -d "+24 hours" +"%Y-%m-%d %H:%M:%S")
+
+          echo "Current SNOW Time (UTC): $SNOW_NOW"
+          echo "Next 24 Hours Mark (UTC): $SNOW_NEXT24"
+
+          # Build the query:
+          # start_date >= now() - 24h and end_date >= now()
+          # state in ["Approved to Implement", "Work in Progress"]
+
+          QUERY="assignment_group=${SNOW_GROUP}^stateINApproved to Implement,Work in Progress^start_dateONORAFTERjavascript:gs.minutesAgo(-1440)^end_dateONORAFTERjavascript:gs.now()^ORDERBYstart_date"
+
+          echo "ServiceNow Query: $QUERY"
+
+          response=$(curl -s -u "${SNOW_USER}:${SNOW_PASSWORD}" \
+            "https://${SNOW_INSTANCE}/api/now/table/change_request?sysparm_query=${QUERY}&sysparm_limit=5&sysparm_fields=number,state,short_description,start_date,end_date" \
+            -H "Accept: application/json")
+
+          echo "Response from ServiceNow:"
+          echo "$response" | jq .
+
+          count=$(echo "$response" | jq '.result | length')
+          if [ "$count" -eq 0 ]; then
+            echo "❌ No valid Change Requests found in the next 24 hours for group ${SNOW_GROUP}."
             exit 1
           fi
 
-      - name: Authenticate to the Org
-        run: sf org login sfdx-url --sfdx-url-file ./AUTHURL.txt --set-default --alias thisOrg
+          echo "✅ Found $count eligible Change Request(s)."
+          echo "$response" | jq -r '.result[] | "\(.number) | \(.state) | \(.start_date) | \(.end_date) | \(.short_description)"'
 
-      - name: Install sfdx git delta
-        run: echo y | sf plugins install sfdx-git-delta
-
-      - name: Create delta package
+      - name: Step 5 - Display status summary
         run: |
-          mkdir -p build/temp/changed-sources
-          echo GOOD_SHA: "${{ vars.LAST_GOOD_SHA_DDIQA }}"
-          sf sgd source delta --from "${{ vars.LAST_GOOD_SHA_DDIQA }}" --to "origin/DDIQAGH" \
-            --output-dir build/temp/changed-sources/ --generate-delta --source-dir force-app/ --ignore-file .gitignore
-          find build/temp/changed-sources/ -type d -empty -delete
-          zip -r build/temp/changed-sources.zip build/temp/changed-sources/
-
-      - name: Display package.xml
-        run: |
-          echo "Contents of package.xml:"
-          cat build/temp/changed-sources/package/package.xml
-
-      - name: Upload zip artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: changed-sources
-          path: build/temp/changed-sources.zip
-          retention-days: 7
-
-      - name: Remove destructiveChanges.xml
-        run: |
-          cat build/temp/changed-sources/destructiveChanges/destructiveChanges.xml || true
-          rm -f build/temp/changed-sources/destructiveChanges/destructiveChanges.xml
-
-      - name: Deploy to Sandbox
-        id: deploy
-        run: |
-          echo "Starting Salesforce Deployment"
-          if ! sf project deploy start \
-            --source-dir build/temp/changed-sources/ \
-            --target-org thisOrg \
-            --wait 360 \
-            --json \
-            --verbose > deploy-result.json 2> deploy-error.log; then
-
-            if grep -q '"name": "NothingToDeploy"' deploy-result.json; then
-              echo "No changes to deploy. Skipping..."
-              echo "deploy_status=Skipped" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-
-            echo "Deployment failed."
-            echo "deploy_status=Failed" >> $GITHUB_OUTPUT
-          else
-            echo "Deployment succeeded."
-            echo "deploy_status=Succeeded" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload deployment result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: deploy-result
-          path: |
-            deploy-result.json
-            deploy-error.log
-          retention-days: 7
-
-  # ==================================================================
-  # JOB: Send Email Notification (only on deployment failure)
-  # ==================================================================
-  Send_Email_Notification:
-    runs-on: uhg-runner-m
-    environment: DDIQA
-    needs: deploy-on-merge
-    if: needs.deploy-on-merge.outputs.deploy_status == 'Failed'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download deployment result
-        uses: actions/download-artifact@v4
-        with:
-          name: deploy-result
-
-      - name: Extract Errors as HTML Table Rows
-        id: grouped
-        run: |
-          echo "<tr style='background-color:#f2f2f2;font-weight:bold;'><td>API Name</td><td>Type</td><td>Line</td><td>Column</td><td>Error Message</td></tr>" > error-rows.html
-
-          jq -r '.result.details.componentFailures[]? 
-            | "<tr><td>\(.fileName)</td><td>\(.componentType)</td><td>\(.lineNumber // "-")</td><td>\(.columnNumber // "-")</td><td>\(.problem)</td></tr>"' \
-            deploy-result.json >> error-rows.html
-
-          echo "rows=$(sed ':a;N;$!ba;s/\n/ /g' error-rows.html)" >> $GITHUB_OUTPUT
-
-      - name: Map PR requester to email
-        id: pr_author
-        run: |
-          EMAIL=$(git log -1 --pretty=format:'%ae')
-          if [ -z "$EMAIL" ]; then
-             EMAIL="default-notify@optum.com"
-          fi
-          echo "Email: $EMAIL"
-          echo "email=$EMAIL" >> $GITHUB_OUTPUT
-
-      - name: Send Email on Failure
-        uses: uhg-pipelines/epl-send-mail@v1
-        with:
-          subject: "Salesforce Deployment Failed - DDIQA"
-          to: "${{ steps.pr_author.outputs.email }}"
-          cc: neha_jain@optum.com, brajesh_tiwary@optum.com, chandrasekhar_uppalapati@optum.com, gopal_shakti@optum.com, shikha_devi@optum.com
-          from: "donotreply@optum.com"
-          body: |
-            <html>
-            <body>
-              <p>Hello,</p>
-              <p>The deployment to <b>DDIQA</b> failed due to the following issues:</p>
-
-              <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Arial, sans-serif; font-size: 13px; width: 100%;">
-                ${{ steps.grouped.outputs.rows }}
-              </table>
-
-              <p>Please fix the above errors and re-run the deployment.</p>
-              <p>Thanks,<br/>DevOps Team</p>
-            </body>
-            </html>
-
-  # ==================================================================
-  # JOB: Save last successful SHA (only if deploy succeeded)
-  # ==================================================================
-  save_last_good_sha:
-    runs-on: uhg-runner-m
-    environment: DDIQA
-    needs: deploy-on-merge
-    if: needs.deploy-on-merge.outputs.deploy_status == 'Succeeded'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Update LAST_GOOD_SHA_DDIQA environment variable
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-          OWNER: ${{ github.repository_owner }}
-          REPO: ${{ github.event.repository.name }}
-          ENV_NAME: DDIQA
-          VARIABLE_NAME: LAST_GOOD_SHA_DDIQA
-          SHA: ${{ github.sha }}
-        run: |
-          echo "Updating $VARIABLE_NAME in environment $ENV_NAME with SHA=$SHA"
-      
-          RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
-            -X PATCH \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            https://api.github.com/repos/$OWNER/$REPO/environments/$ENV_NAME/variables/$VARIABLE_NAME \
-            -d "{\"name\":\"$VARIABLE_NAME\",\"value\":\"$SHA\"}")
-      
-          if [ "$RESPONSE" -eq 404 ]; then
-            echo "Variable not found, creating instead..."
-            RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
-              -X POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              https://api.github.com/repos/$OWNER/$REPO/environments/$ENV_NAME/variables \
-              -d "{\"name\":\"$VARIABLE_NAME\",\"value\":\"$SHA\"}")
-          fi
-      
-          echo "HTTP Response: $RESPONSE"
-          cat response.json
+          echo "✅ GitHub → SNOW Time Difference: ${DIFF_MIN} minutes"
+          echo "✅ Change Requests Approved or WIP in next 24h retrieved successfully."
