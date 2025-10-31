@@ -1,0 +1,8 @@
+- name: Cleanup AsyncResultId
+  run: |
+    echo "Clearing Async ID..."
+    curl -X PATCH \
+      -H "Accept: application/vnd.github+json" \
+      -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+      https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/environments/PROD/variables/LAST_VALIDATION_ASYNC_ID \
+      -d '{"name":"LAST_VALIDATION_ASYNC_ID","value":"  "}'
